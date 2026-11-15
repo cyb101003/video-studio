@@ -244,13 +244,16 @@ def cmd_models(args: argparse.Namespace) -> None:
 def cmd_setup(args: argparse.Namespace) -> None:
     cfg = Config()
     if args.set:
+        # 两种写法都收：ark=密钥（provider 名）/ ARK_API_KEY=密钥（环境变量名）
+        env_alias = {v: k for k, v in Config.KEY_ENVS.items()}
         for pair in args.set:
             if "=" not in pair:
-                fail(f"格式应为 provider=key，收到：{pair}")
+                fail(f"格式应为 provider=key 或 环境变量名=key，收到：{pair}")
             prov, val = pair.split("=", 1)
-            prov = prov.strip()
+            prov = env_alias.get(prov.strip(), prov.strip())
             if prov not in Config.KEY_ENVS:
-                fail(f"未知 provider：{prov}。可选：{', '.join(Config.KEY_ENVS)}")
+                fail(f"未知 provider：{prov}。可选：{', '.join(Config.KEY_ENVS)}"
+                     f"（也可直接写环境变量名，如 {Config.KEY_ENVS['ark']}）")
             path = cfg.write_env_line(prov, val.strip())
             log(f"已写入 {path.name}：{Config.KEY_ENVS[prov]}", level="ok")
         return
@@ -1085,7 +1088,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("setup", help="配置密钥（看指引或直接写入）")
     p.add_argument("--set", nargs="*", metavar="PROVIDER=KEY",
-                   help="例如 --set ARK_API_KEY=xxx")
+                   help="例如 --set ARK_API_KEY=xxx（也可写 --set ark=xxx）")
     p.set_defaults(func=cmd_setup)
 
     p = sub.add_parser("init", help="创建项目骨架")
