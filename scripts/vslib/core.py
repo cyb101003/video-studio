@@ -68,6 +68,8 @@ class Config:
         "runway": "RUNWAY_API_KEY",
         "veo": "GEMINI_API_KEY",
         "luma": "LUMA_API_KEY",
+        "fal": "FAL_KEY",
+        "heygen": "HEYGEN_API_KEY",
     }
 
     def __init__(self, cwd: Path | None = None) -> None:
@@ -79,7 +81,9 @@ class Config:
         for path in (USER_CONFIG, self.cwd / ENV_FILE):
             if path.is_file():
                 self._parse(path)
-        for key in list(self.KEY_ENVS.values()) + ["VS_DEFAULT_PROVIDER", "ARK_BASE_URL"]:
+        for key in list(self.KEY_ENVS.values()) + [
+            "VS_DEFAULT_PROVIDER", "ARK_BASE_URL", "VS_MAX_COST", "FAL_KEY",
+        ]:
             if os.environ.get(key):
                 self._values[key] = os.environ[key]
 

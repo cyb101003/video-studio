@@ -1,6 +1,6 @@
 ---
 name: video-studio
-description: AI 视频生成全流程工作台。对接可灵 Kling、即梦 Seedance（火山方舟）、海螺 MiniMax、Vidu、Runway、Veo、Luma 七家视频模型，用一套参数统一下单，并内置「制作圣经锁定角色一致性 → 分镜脚本 → 静帧与草稿预演 → 定稿与多候选（可逐镜尾帧链）→ 质检 → 后期成片」的完整生产管线。执行前必须分多轮询问用户：是否需要剪辑、是否要字幕/配乐/配音/片头，未获逐项明确确认不得擅自合成或加效果；用户只要片段时只交付片段。当用户要做视频、生成视频、AI 视频、文生视频、图生视频、首尾帧视频、短视频、宣传片、口播视频、产品视频、分镜、脚本转视频，或提到可灵/即梦/Seedance/海螺/Vidu/Runway/Veo/Luma/Sora 等模型名时使用。也适用于用户已有视频片段需要拼接、加字幕、配乐、配音的后期场景。
+description: AI 视频工作台：直连 7 家模型 + fal.ai / HeyGen 网关，统一分镜 → 生成 → 质检 → 成片管线。用户要做视频、文生视频/图生视频/首尾帧、分镜转视频、拼接片段、加字幕配乐配音、对话式改片、导出平台版本，或提到可灵/即梦/Seedance/海螺/Vidu/Runway/Veo/Luma/Sora/Gemini Omni/fal 时使用。开工前必须分多轮逐项询问是否剪辑、是否加字幕配乐等，未获明确确认不得擅自合成或加效果。
 agent_created: true
 ---
 
@@ -117,6 +117,8 @@ vs.py plan --takes 3 --draft --chain  # 确认单同步显示倍数与加速环�
 - 把 `chain --apply` 当成定稿后的收尾步骤（视频不会变，等于白做或被迫整批重跑）
 - 第 5 轮报成本时漏算候选 / 草稿的倍数，让用户按 1 倍的价格确认了 3.5 倍的生成
 - 拿「行业最佳实践」当理由，替用户决定做哪些环节
+- 没问就跑 `voice` / `media` / `edit` / `export` / `run --fallback` / `run --parallel`（都会额外花钱或产生新文件）
+- 把「网关能调 Sora / Gemini Omni」当成已经验证可用：这些适配器只验过端点结构，**没跑过真实付费生成**
 
 > 代码层已经兜底：`assemble` 默认**纯拼接**，字幕/配乐/片头/转场/淡入淡出全部默认关闭，
 > 且**不再读取** `storyboard.json` 里的 `bgm`/`transition`/字幕设置（除非显式 `--use-storyboard`）。
@@ -128,9 +130,11 @@ vs.py plan --takes 3 --draft --chain  # 确认单同步显示倍数与加速环�
 
 ## 能力边界
 
-**能做**：文生视频、图生视频、首尾帧过渡、参考图生视频、多镜头拼接、字幕、配音、配乐、转场、片头。
+**能做**：文生视频、图生视频、首尾帧过渡、参考图生视频、多镜头拼接、字幕、配音、配乐、转场、片头；网关聚合（fal.ai / HeyGen，一个 key 调多模型）、对话式局部改片（Gemini Omni）、静帧/音乐/音效素材生成、SRT 转录结果对齐、多平台尺寸导出与封面、候选并排预览、逐镜画面证据质检。
 
-**不做**：长视频自动剪辑（这是剪辑软件的事）、真人换脸、声音克隆、需要登录态的网页操作。
+**不做**：本地 ASR 语音识别（需第三方服务；本 skill 只负责对齐外部产出的 SRT/VTT）、长视频自动剪辑、真人换脸、声音克隆、需要登录态的网页操作。MuAPI 等无公开可核对 REST 文档的网关没有适配，避免再造一个纸面 provider。
+
+> **新增能力全部默认关闭**，必须用户明确要求后才调用。网关 / Omni / 素材生成的端点结构核对自官方文档（2026-11-15），但**尚未用真实密钥跑通**，第一次实单要当作试跑并核对返回字段。
 
 ## 生产管线（确认之后，怎么把活做对）
 
@@ -413,8 +417,22 @@ python3 scripts/vs.py clips              # 只要列清单，不合成
 | `vs.py list` / `status` / `fetch` / `resume` | 任务管理 |
 | `vs.py clips` | **只交付片段**时列清单（可加 `--json`） |
 | `vs.py assemble` | 合成成片，**默认纯拼接，附加效果需显式开启** |
+| `vs.py run --parallel N` | 批量提交 + 统一轮询，多镜明显提速（不能与 `--chain` / `--takes` 同用） |
+| `vs.py run --fallback` | 某镜失败自动换备用模型（会产生新任务，须用户同意） |
+| `vs.py run --max-cost 20` | 整批成本硬上限，超了直接拦截；也可写 `project.json` 或 `VS_MAX_COST` |
+| `vs.py voice --text "..." [--replace-into x.mp4]` | 中文配音 + 量真实时长（MiniMax TTS，需 `MINIMAX_API_KEY`） |
+| `vs.py align --srt x.srt` | 导入外部 ASR/SRT 转录，生成对齐时间轴 |
+| `vs.py media --kind image\|music\|sfx\|video --prompt "..."` | 生成素材（fal 网关，需 `FAL_KEY`） |
+| `vs.py edit --video x.mp4 --prompt "把车换成红色"` | 对话式局部改片；`--previous last` 接着上一轮改 |
+| `vs.py export --presets douyin,bilibili --cover` | 导出多平台规格 + 封面（需 ffmpeg） |
+| `vs.py sheet` / `cover` / `presets` | 候选并排预览图 / 抽封面 / 列出平台预设 |
+| `vs.py qc` | 自动检查 + **逐镜缩略图与首末帧证据** + 人工清单 |
 
-几乎所有命令都支持 `--provider kling|ark|minimax|vidu|runway|veo|luma`，默认 `auto` 会自动选有密钥且能力匹配的那家。
+几乎所有命令都支持 `--provider`，可选 `kling|ark|minimax|vidu|runway|veo|luma|fal|heygen`，默认 `auto` 会自动选有密钥且能力匹配的那家。网关 provider 可用 `--model` 传任意市场 model-id，详见 `references/gateways.md`。
+
+**预算守护**：`--max-cost` / `project.json` 的 `max_cost` / 环境变量 `VS_MAX_COST` 三选一，提交前按公开单价粗估拦截。它是量级刹车，不是账单。
+
+**并发与降级**：`--parallel` 先一次提交所有镜头再统一轮询；`--fallback` 在失败时换模型救急。两者都必须是用户明确同意后才用——前者一次提交整批（中断成本更高），后者会产生新任务且可能风格漂移。
 
 ## 各家怎么选
 
@@ -427,7 +445,9 @@ python3 scripts/vs.py clips              # 只要列清单，不合成
 | 快速草稿 | vidu / luma flash | 便宜快，用来试构图 |
 | 已有画面要改风格 | runway gen4_aleph | 视频转视频 |
 
-`auto` 的默认顺序是 ark → kling → minimax → vidu → runway → veo → luma，即"性价比优先"。用户明确要画质时再手动指定 veo。**想换模型也先跟用户说一声**，价格差别很大。
+`auto` 的默认顺序是 ark → kling → minimax → vidu → runway → veo → luma → fal → heygen，即「性价比优先」，网关排在最后（只配了 `FAL_KEY` 时 `auto` 依然可用）。用户明确要画质时再手动指定 veo。**想换模型也先跟用户说一声**，价格差别很大。
+
+只申请一个 key 想覆盖多模型时用网关：`--provider fal --model <市场 model-id>`，见 `references/gateways.md`。**别把网关说成已验证可用**，端点结构核过，实单没跑过。
 
 ## 常见问题
 
@@ -450,21 +470,25 @@ python3 scripts/vs.py clips              # 只要列清单，不合成
 ```
 scripts/vs.py                命令行入口
 scripts/vslib/core.py        配置、HTTP、媒体工具
-scripts/vslib/providers.py   七家模型适配器（新增一家改这里）
-scripts/vslib/jobs.py        任务持久化与轮询
+scripts/vslib/providers.py   七家直连适配器（新增一家改这里）
+scripts/vslib/gateway.py     网关聚合 / Gemini Omni 改片 / 素材生成
+scripts/vslib/delivery.py    平台导出 / 并排预览 / 封面
+scripts/vslib/jobs.py        任务持久化（跨进程锁）+ 并发提交与统一轮询
 scripts/vslib/storyboard.py  分镜结构
-scripts/vslib/post.py        ffmpeg 后期
+scripts/vslib/post.py        ffmpeg 后期 / TTS / 抽帧
 scripts/vslib/pipeline.py   制作圣经/候选版本/尾帧链/质检
 references/intake.md         ★ 多轮问询手册、话术、决策树
 references/pipeline.md       ★ 生产管线手册（一致性三板斧、阶段 0–7、故障速查）
-references/providers.md      七家参数对照表
+references/gateways.md       ★ 网关接口、model-id 查法、改片限制、未验证清单
+references/providers.md      七家参数对照表（含快照日期）
 references/prompt-guide.md   提示词与镜头语言手册
 references/workflow.md       工作流细节与进阶用法
 references/troubleshooting.md 排错手册
+tests/                       标准库单测，CI 每次提交自动跑
 assets/project-template/     项目骨架与 brief.md 模板
 ```
 
-需要查某家的具体参数限制时读 `references/providers.md`，不要靠记忆猜。
+需要查某家的具体参数限制时读 `references/providers.md`，用网关或改片/素材能力时读 `references/gateways.md`，不要靠记忆猜。
 每次开工前读 `references/intake.md`，做多镜头项目再读 `references/pipeline.md`，不要靠记忆走流程。
 
 项目里会多出两个记录文件，都是内部状态、不要手改：

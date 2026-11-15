@@ -30,8 +30,12 @@
 | `runway` | Runway Gen-4 / Gen-4.5 | `RUNWAY_API_KEY` | 0.36 – 0.86 |
 | `veo` | Google Veo 3.1 | `GEMINI_API_KEY` | 1.20 – 2.90 |
 | `luma` | Luma Ray | `LUMA_API_KEY` | 0.30 – 0.60 |
+| `fal` | fal.ai 网关（一个 key 调市场里十余模型） | `FAL_KEY` | 各模型不同 |
+| `heygen` | HeyGen 网关（Veo / Kling / Sora / Runway / Seedance） | `HEYGEN_API_KEY` | 按工作流计 |
 
-不写 `--provider` 就是 `auto`：自动挑有密钥、且能力匹配（文生视频 / 图生视频 / 首尾帧）的那家。价格是粗估，实际以各家控制台账单为准，跑 `vs.py models` 可以看模型清单。
+不写 `--provider` 就是 `auto`：自动挑有密钥、且能力匹配（文生视频 / 图生视频 / 首尾帧）的那家。价格是粗估，实际以各家控制台账单为准，跑 `vs.py models` 可以看模型清单与快照日期。
+
+**网关型**用 `--model` 传 fal 市场里的任意 model-id，Sora、Wan、PixVerse、Seedance 2.0 等不必等脚本更新。详见 `references/gateways.md`。注意：网关端点只验过结构，**没跑过真实付费生成**。
 
 **新手建议从 `ark`（火山方舟）开始**：国内直连、按秒计费、有免费额度、中文提示词友好。
 
@@ -106,7 +110,9 @@ vs setup --set ark=你的密钥
 export ARK_API_KEY=你的密钥
 ```
 
-七家的环境变量名见上面第二节的表格。**密钥只存在本地，不要提交到仓库。**
+九家（含两个网关）的环境变量名见上面第二节的表格。**密钥只存在本地，不要提交到仓库。**
+
+预算可以设一道硬刹车，三选一：`--max-cost 20`、`project.json` 里写 `"max_cost": 20`、或环境变量 `VS_MAX_COST=20`。提交前按公开单价粗估，超过就拦截。**它是量级刹车，不是账单。**
 
 ---
 
@@ -236,7 +242,16 @@ vs assemble --subtitles --bgm audio/bgm.mp3 --title "咖啡店" --transition fad
 | `run --takes 3` / `takes` / `pick s1 B` | 每镜 A/B/C 候选、挑版（不重新生成、不花钱） |
 | `run --chain` | **推荐**：边生成边把上一镜末帧接成下一镜首帧 |
 | `chain` / `chain --apply` | 尾帧链补救（只预览 / 真写入，写入后须 `--force` 重跑后续镜头） |
-| `qc` | 自动质检 + 人工过目清单 |
+| `qc` | 自动质检 + **逐镜缩略图与首末帧证据** + 人工清单 |
+| `run --parallel N` | 批量提交 + 统一轮询，多镜提速（不与 `--chain` / `--takes` 同用） |
+| `run --fallback` | 失败自动换备用模型（会产生新任务，须先确认） |
+| `run --max-cost 20` | 整批成本硬上限 |
+| `voice --text "..."` | 中文配音 + 量真实时长（MiniMax TTS） |
+| `align --srt x.srt` | 导入外部 ASR 转录，生成对齐时间轴 |
+| `media --kind image --prompt "..."` | 生成静帧 / 音乐 / 音效 / 视频素材 |
+| `edit --video x.mp4 --prompt "..."` | 对话式局部改片，`--previous last` 多轮续改 |
+| `export --presets douyin,bilibili --cover` | 多平台规格导出 + 封面 |
+| `sheet` / `cover` / `presets` | 候选并排预览 / 抽封面 / 列平台预设 |
 
 ---
 
@@ -256,7 +271,62 @@ vs assemble --subtitles --bgm audio/bgm.mp3 --title "咖啡店" --transition fad
 
 ---
 
-## 十、常见问题
+## 十、更多能力（全部显式调用，默认关闭）
+
+### 网关聚合：一个 key 调多模型
+
+```bash
+vs.py setup --set FAL_KEY=你的密钥
+vs.py models                                   # 看快照日期和已核实的 model-id
+vs.py gen -p "城市夜景" --provider fal --model alibaba/wan-3.0/text-to-video -d 5
+```
+
+`fal` / `heygen` 是网关型：一个 key 覆盖 Veo、Kling、Sora、Runway、Seedance、Wan 等（取决于市场上架情况）。`--model` 可传任意市场 model-id，脚本不硬编码猜测值。去 https://fal.ai/models 查当前 ID。详见 `references/gateways.md`。
+
+### 对话式局部改片
+
+```bash
+vs.py edit --video videos/s1.mp4 --prompt "把车换成红色，其他保持不变"
+vs.py edit --previous last --prompt "再让光线更暖一些"     # 多轮续改
+```
+
+走 Gemini Omni Interactions API，和 Veo 共用 `GEMINI_API_KEY`。内联视频 ≤ 4MB、单轮 3–15 秒，更大的视频要先走 Files API。改片提示词要短，加「其他保持不变」能减少误改。
+
+### 音频链路
+
+```bash
+vs.py voice --text "清晨的光落进店里" --out audio/vo.mp3
+vs.py voice --shot s1 --replace-into videos/s1.mp4        # 配音并替换音轨
+vs.py align --srt 转录结果.srt                            # 用真实转录时间轴替代按字数估时
+```
+
+`voice` 调 MiniMax TTS 并量出音频真实时长。`align` 解析标准 SRT / WebVTT —— **本地不内置语音识别**，任何 ASR 工具产出的字幕都能直接喂进来对齐。
+
+### 素材生成
+
+```bash
+vs.py media --kind image --prompt "咖啡店店员，齐肩深棕发，深绿高领针织衫" --out images/hero.png
+vs.py media --kind music --prompt "温暖的爵士钢琴" --model <你在 fal 市场确认的 model-id>
+```
+
+静帧/音乐/音效走 fal 通用队列。`music` / `sfx` 的默认 model-id 是占位值，**必须自己指定核实过的 ID**，否则会明确报错。
+
+### 平台交付
+
+```bash
+vs.py presets                                        # 抖音 / 小红书 / B站 / YouTube / 方形
+vs.py export --presets douyin,bilibili --cover --watermark "@我的账号"
+vs.py sheet --cols 3                                 # 候选 A/B/C 并排预览图
+vs.py cover --at 2.5                                 # 抽封面
+```
+
+`export` 用 ffmpeg 做等比 scale + pad（不拉伸）、平台码率、右下角水印、封面帧。全部显式调用，`assemble` 不会自动做。
+
+> **授权约定不变**：上面所有能力都默认关闭，必须用户明确要求后才调用。网关 / Omni / 素材生成的端点结构核对自官方文档（2026-11-15），但**尚未跑过真实付费生成**，第一次实单要当试跑并核对返回字段。
+
+---
+
+## 十一、常见问题
 
 **没有 ffmpeg 会怎样？**
 只生成片段完全不受影响。`assemble`、`animatic`、`chain --apply`、`run --chain` 会提示缺依赖。装完重跑即可。
@@ -278,16 +348,25 @@ vs assemble --subtitles --bgm audio/bgm.mp3 --title "咖啡店" --transition fad
 
 ---
 
-## 十一、项目结构
+## 十二、项目结构
 
 ```
 ~/.workbuddy/skills/video-studio/
 ├── SKILL.md                 技能主说明（Agent 实际读的操作手册）
 ├── README.md                本教程
+├── LICENSE                  MIT
+├── VERSION / CHANGELOG.md   版本与变更记录
 ├── scripts/
 │   ├── vs.py                命令行入口
-│   └── vslib/               provider 适配、任务、后期、分镜、生产管线
-├── references/              问询手册、生产管线、参数对照、提示词、排错
+│   └── vslib/
+│       ├── providers.py      七家直连适配
+│       ├── gateway.py        网关聚合、对话式改片、素材生成
+│       ├── delivery.py       平台导出、并排预览、封面
+│       ├── jobs.py           任务持久化（带跨进程锁）与并发轮询
+│       ├── post.py           ffmpeg 后期、TTS、抽帧
+│       └── pipeline.py / storyboard.py / core.py
+├── references/              问询手册、生产管线、网关手册、参数对照、提示词、排错
+├── tests/                   标准库单测，CI 每次提交自动跑
 └── assets/project-template/ 项目模板（brief.md / storyboard.json）
 ```
 
@@ -302,13 +381,14 @@ my-video/
 └── .vs/
     ├── jobs.json        任务记录，含 prompt / seed / 模型 / 版本
     ├── takes.json       每镜候选清单
+    ├── edits.json       对话式改片的多轮 interaction id
     ├── model-lock.json 本项目锁定的 provider
-    └── work/            中间文件（可删）
+    └── work/            中间文件、逐镜缩略图与首末帧证据（可删）
 ```
 
 ---
 
-## 十二、文档索引
+## 十三、文档索引
 
 | 文件 | 内容 |
 |---|---|
@@ -317,13 +397,18 @@ my-video/
 | `references/pipeline.md` | 生产管线方法论：一致性三板斧、阶段顺序、故障速查 |
 | `references/workflow.md` | 项目结构与字段全表、交付前检查清单 |
 | `references/providers.md` | 七家参数对照与限制（首尾帧、参考图、时长等） |
+| `references/gateways.md` | 网关接口格式、model-id 怎么查、改片限制、未验证清单 |
 | `references/prompt-guide.md` | 提示词写法 |
 | `references/troubleshooting.md` | 排错速查 |
 
 ---
 
-## 十三、当前状态
+## 十四、当前状态
 
-七家接口的 endpoint 与请求体结构已用无效密钥逐一探测验证（都停在鉴权层），后期链路用 ffmpeg 桩跑通了完整编排，**但还没有跑过真实付费生成**。所以各家的轮询路径、结果字段解析、真实编码效果仍需拿到密钥后做一次端到端实单验证。成本数字是按公开价格粗估，不是账单。
+**验证到什么程度**：七家直连 + 两个网关的 endpoint 与鉴权头已用无效密钥逐一探测（都停在 401/403 鉴权层），后期链路用 ffmpeg 桩跑通了完整编排，单测与 CI 覆盖核心逻辑。**但还没有跑过任何真实付费生成** —— 各家的轮询状态、结果字段解析、图片上传方式、真实编码效果都要拿到密钥后做端到端实单才能确认。新增的网关 / Omni / 素材生成适配器尤其要当试跑。成本数字是按公开价格的粗估，不是账单。
 
-有问题或踩到坑，欢迎提 issue。
+**模型与价格会过期**：`RATES` 与 `references/providers.md` 标了快照日期 `2026-11-15`，用前请核对各家控制台。`vs.py models` 会打印这个日期。
+
+**已知边界**：本地不内置 ASR（只对齐外部 SRT）；`music` / `sfx` 素材生成的默认 model-id 是占位值，必须自己指定；MuAPI 等无可核对公开文档的网关没有适配；Windows 只做了路径与字体兜底，未实测。
+
+MIT 许可，欢迎提 issue 或 PR。

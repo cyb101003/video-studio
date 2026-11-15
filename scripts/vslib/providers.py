@@ -699,8 +699,20 @@ PROVIDERS: dict[str, type[Provider]] = {
     "luma": Luma,
 }
 
-# 自动选路偏好：按"性价比 + 国内可用性"排序
-AUTO_ORDER = ["ark", "kling", "minimax", "vidu", "runway", "veo", "luma"]
+# 自动选路偏好：按"性价比 + 国内可用性"排序。
+# 网关放在最后：直连通常更便宜；但只配了网关 key 时 auto 依然可用。
+AUTO_ORDER = ["ark", "kling", "minimax", "vidu", "runway", "veo", "luma", "fal", "heygen"]
+
+
+def register_gateways() -> None:
+    """延迟注册网关 provider。
+
+    gateway.py 需要本模块的 Provider 基类，所以不能在模块加载期反向导入；
+    由入口在 providers 完全加载后调用一次。
+    """
+    from .gateway import Fal, HeyGen
+    PROVIDERS.setdefault("fal", Fal)
+    PROVIDERS.setdefault("heygen", HeyGen)
 
 
 def get_provider(name: str, cfg: Config) -> Provider:

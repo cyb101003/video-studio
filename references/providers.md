@@ -1,6 +1,9 @@
-# 七家视频模型参数对照
+# 视频模型参数对照（七家直连 + 两个网关）
 
-需要确认某家的限制时查这里，不要靠记忆猜。字段以各家官方文档为准，`scripts/vslib/providers.py` 里的实现已做归一化。
+**参数与费率快照：2026-11-15。** 厂商改模型 ID、时长档位、价格都很频繁，用前请核对各家控制台；`vs.py models` 会打印这个日期。字段以各家官方文档为准，`scripts/vslib/providers.py` 与 `gateway.py` 里的实现已做归一化。
+
+> 网关 provider（`fal` / `heygen`）的接口格式、model-id 查法与未验证清单见 `references/gateways.md`。
+> 所有 provider 的 endpoint 与鉴权头只用无效密钥验证过（停在鉴权层），**结果字段与轮询状态尚未跑过真实实单**。
 
 ## 总览
 
@@ -13,6 +16,8 @@
 | Runway | `runway` | `RUNWAY_API_KEY` | gen4_turbo | 生态成熟、有视频转视频 |
 | Veo | `veo` | `GEMINI_API_KEY` | veo-3.1-generate-preview | 画质最好、原生音效 |
 | Luma | `luma` | `LUMA_API_KEY` | ray-2 | 画面美学强 |
+| fal.ai 网关 | `fal` | `FAL_KEY` | alibaba/wan-3.0/text-to-video | 一个 key 调市场里任意模型，`--model` 指定 |
+| HeyGen 网关 | `heygen` | `HEYGEN_API_KEY` | veo_3_1 | 一个 key 覆盖 Veo/Kling/Sora/Runway/Seedance |
 
 ## 时长与分辨率
 

@@ -6,18 +6,55 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import random
 import string
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .core import Config, download, fail, log, now_stamp, slugify, state_dir
 from .providers import JobStatus, Provider, get_provider
 
 TERMINAL = ("succeeded", "failed")
+
+
+@contextlib.contextmanager
+def _file_lock(path: Path) -> Iterator[None]:
+    """跨进程互斥。POSIX 用 flock，Windows 用 msvcrt，都不可用时退化为无锁 + 原子写。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(path, "a+")
+    locked = False
+    try:
+        if os.name == "nt":
+            try:
+                import msvcrt
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+                locked = True
+            except (ImportError, OSError):
+                pass
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            locked = True
+        yield
+    finally:
+        if locked:
+            if os.name == "nt":
+                try:
+                    import msvcrt
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                except (ImportError, OSError):
+                    pass
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        fh.close()
 
 
 def new_job_id(provider: str) -> str:
@@ -69,9 +106,24 @@ class JobStore:
                 continue
 
     def save(self) -> None:
+        """持锁写入，并与磁盘上其它进程刚写入的记录合并，避免互相覆盖导致重复扣费。"""
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"jobs": [asdict(j) for j in self._jobs.values()]}
-        self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        with _file_lock(self.path.with_suffix(".lock")):
+            disk: dict[str, dict] = {}
+            if self.path.is_file():
+                try:
+                    raw = json.loads(self.path.read_text(encoding="utf-8"))
+                    for item in raw.get("jobs", []):
+                        if isinstance(item, dict) and item.get("id"):
+                            disk[item["id"]] = item
+                except (OSError, json.JSONDecodeError):
+                    pass
+            for jid, job in self._jobs.items():
+                disk[jid] = asdict(job)
+            tmp = self.path.with_name(self.path.name + ".tmp")
+            tmp.write_text(json.dumps({"jobs": list(disk.values())},
+                                      ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, self.path)
 
     def add(self, **kw: Any) -> Job:
         jid = kw.pop("id", None) or new_job_id(kw.get("provider", "vs"))
@@ -119,6 +171,73 @@ def submit_and_track(cfg: Config, store: JobStore, provider: Provider, req: Any,
     if auto_wait:
         wait(cfg, store, job, timeout=timeout, quiet=quiet)
     return job
+
+
+def submit_many(cfg: Config, store: JobStore, provider: Provider,
+                items: list[tuple[str, Any]], quiet: bool = False) -> list[Job]:
+    """一次性把所有镜头提交出去（不等结果）。失败的单镜单独记 failed，不影响其它镜头。"""
+    jobs: list[Job] = []
+    for shot, req in items:
+        model = provider.pick_model(req)
+        if not quiet:
+            log(f"[{provider.label}] 提交 {shot or '-'} · {model} · {req.summary()}", level="step")
+        try:
+            remote_id = provider.submit(req)
+            if not remote_id:
+                raise RuntimeError("提交后没有拿到任务 ID")
+            job = store.add(
+                provider=provider.name, remote_id=str(remote_id), model=model,
+                prompt=req.prompt, mode=req.mode, duration=int(req.duration),
+                ratio=req.ratio, resolution=req.resolution, audio=bool(req.audio),
+                state="queued", shot=shot, cost_note=provider.price_hint,
+            )
+        except Exception as e:
+            log(f"{shot or '-'} 提交失败：{e}", level="err")
+            job = store.add(
+                provider=provider.name, remote_id="", model=model,
+                prompt=req.prompt, mode=req.mode, duration=int(req.duration),
+                ratio=req.ratio, resolution=req.resolution, audio=bool(req.audio),
+                state="failed", shot=shot, error=str(e)[:300],
+                cost_note=provider.price_hint,
+            )
+        jobs.append(job)
+    return jobs
+
+
+def wait_many(cfg: Config, store: JobStore, jobs: list[Job], *,
+              timeout: int = 900, interval: int = 8, quiet: bool = False) -> list[Job]:
+    """统一轮询一批任务，而不是「提交一镜等一镜」。"""
+    pending = [j for j in jobs if j.state not in TERMINAL]
+    deadline = time.time() + timeout
+    started = time.time()
+    while pending and time.time() < deadline:
+        for job in list(pending):
+            try:
+                st: JobStatus = get_provider(job.provider, cfg).poll(job.remote_id)
+            except Exception as e:
+                log(f"{job.shot or job.id} 查询异常：{e}", level="warn")
+                continue
+            if st.state != job.state:
+                if not quiet:
+                    log(f"  {job.shot or job.id} → {st.state} ({int(time.time() - started)}s)")
+                job.state = st.state
+                store.save()
+            if st.state == "succeeded" and st.url:
+                job.url = st.url
+                job.error = ""
+                store.save()
+                save_video(job, st.url, store)
+                pending.remove(job)
+            elif st.state == "failed":
+                job.error = st.error or "未知错误"
+                store.save()
+                pending.remove(job)
+        if pending:
+            time.sleep(interval)
+    for job in pending:
+        job.error = f"等待超时（{timeout}s），可稍后 resume 继续"
+        store.save()
+    return jobs
 
 
 def wait(cfg: Config, store: JobStore, job: Job, *, timeout: int = 900,

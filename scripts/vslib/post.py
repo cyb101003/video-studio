@@ -207,6 +207,7 @@ def write_srt(cues: list[tuple[float, float, str]], path: Path) -> Path:
     lines: list[str] = []
     for i, (start, end, text) in enumerate(cues, 1):
         lines += [str(i), f"{srt_time(start)} --> {srt_time(end)}", text.strip(), ""]
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")
     return path
 

@@ -243,7 +243,10 @@ post.replace_audio(Path("out-sub.mp4"), Path("audio/vo.mp3"), Path("final.mp4"))
 
 - [ ] **`brief.md` 里五轮询问都有明确结论**，没有把空白当默认
 - [ ] 加速环节（静帧 / 草稿 / 多候选 / 尾帧链）每一项都有明确授权，没答的没做
-- [ ] `vs.py qc` 跑过，自动检查无「混用多个模型」告警，人工清单逐条过目
+- [ ] `vs.py qc` 跑过，自动检查无「混用多个模型」告警，人工清单逐条过目；
+      **打开 `.vs/work/qc-sheet.png` 与 `qc-joints/` 逐镜看画面连贯性**（有 ffmpeg 时才有）
+- [ ] 新增能力（`voice` / `media` / `edit` / `export` / `sheet` / `cover` / `--fallback` / `--parallel`）
+      每一项都有明确授权，没答的没做；预算上限（若设了）没有被绕过
 - [ ] 有人物/产品的项目填了 `bible.json` 身份块，且全项目同一个 provider + 同一个 seed
 - [ ] 用户答「只要片段」→ `output/` 是空的，交付的是 `videos/*.mp4`
       （草稿粗剪在 `.vs/work/animatic.mp4`，不算成片，不会污染 `output/`）

@@ -218,6 +218,32 @@ rm -rf .vs/work
 多半是选了 `--takes 3` / `--stage draft`，但第 5 轮 `estimate` 只报了 1 倍。
 用 `vs.py estimate --takes 3 --draft` 和 `vs.py plan --takes 3 --draft --chain` 重新报账，再请用户确认一次。
 
+## 新增能力常见问题
+
+### `voice` 报「配音需要 MiniMax 密钥」
+`voice` 走 MiniMax T2A v2，需要 `MINIMAX_API_KEY`（和海螺视频共用一个 key）。没有就先配，或者用外部配音文件 + `voice --replace-into`。
+
+### `align` 解析出 0 条
+只认标准 SRT / WebVTT 时间码（`00:00:00,000 --> 00:00:02,500`）。ASR 工具导出的纯文本、JSON 要先转成 SRT。本地**不做语音识别**，这一步只负责对齐。
+
+### `media --kind music/sfx` 报错
+这两个类型的默认 model-id 是占位值，没在 fal 市场核实过。用 `--model` 指定你确认过的 ID，并核对它的输入字段（`Fal.submit()` 只填通用字段）。
+
+### `edit` 说视频超过 4MB
+Gemini Omni 内联 base64 上限 4MB。更大的视频要先走 Files API 上传，再用 `--video-uri` 传 URI；本脚本没实现上传。另外单轮 3–15 秒、只支持 16:9 / 9:16。
+
+### `run --parallel` 和 `--chain` / `--takes` 冲突
+会显式拦下。尾帧链必须在生成下一镜之前完成，只能串行；并发模式也暂不支持候选/草稿的版本命名。普通多镜定稿用 `--parallel` 最快。
+
+### 预算被 `--max-cost` 拦下
+这是按公开单价的粗估刹车，不是账单。可以调小 `--takes`、去掉草稿、缩短时长、换便宜 provider，或明确提高上限后重跑。**提高上限等于用户重新确认成本，要再问一次。**
+
+### 网关返回「找不到媒体 URL」
+`_media_url()` 覆盖了 video/images/audio 三种常见 schema，但各模型输出不统一。把真实响应贴出来，按该模型补一个字段路径即可。这正是「只验过端点结构」的风险点。
+
+### 多终端同时跑会不会覆盖任务记录
+不会：`.vs/jobs.json` 写入带跨进程文件锁，且每次写入会与磁盘上其它进程刚写的记录合并。macOS / Linux 用 flock，Windows 用 msvcrt，都不可用时退化为原子替换。
+
 ## 快速诊断顺序
 
 遇到问题按这个顺序过一遍，80% 情况能定位：

@@ -17,11 +17,16 @@
   vs.py run --takes 3 / takes / pick 每镜多候选，挑最好的一版
   vs.py run --chain                 逐镜尾帧链（推荐，边生成边衔接）
   vs.py chain --apply               补救用：改首帧图后须 --force 重跑后续镜头
-  vs.py qc                           成片前质检
+  vs.py qc                           成片前质检（含逐镜画面证据）
   vs.py gen -p "描述" -d 5           生成一个片段
   vs.py run                          按分镜批量生成定稿
+  vs.py run --parallel 4             批量提交 + 统一轮询（多镜提速）
+  vs.py run --max-cost 20            成本硬上限，超了拦截
   vs.py clips                        只交付片段
   vs.py assemble                     合成成片（默认纯拼接）
+  vs.py voice / align                中文配音 / 导入 SRT 对齐时间轴
+  vs.py media / edit                 生成素材 / 对话式局部改片
+  vs.py export / sheet / presets     多平台导出 / 候选并排预览 / 预设清单
 """
 
 from __future__ import annotations
@@ -36,6 +41,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from vslib import post, storyboard as sbmod
+from vslib import gateway
+try:
+    from vslib import delivery
+except ImportError:  # 交付层尚未安装时，其余命令仍可正常使用
+    delivery = None
 from vslib.pipeline import Bible, TakesStore, chain_plan, qc
 from vslib.core import (
     Config,
@@ -54,16 +64,23 @@ from vslib.core import (
     slugify,
     state_dir,
 )
-from vslib.jobs import JobStore, resume_all, save_video, submit_and_track, wait
+from vslib.jobs import (JobStore, resume_all, save_video, submit_and_track,
+                        submit_many, wait, wait_many)
 from vslib.providers import (
     AUTO_ORDER,
     PROVIDERS,
     GenRequest,
     get_provider,
+    register_gateways,
     resolve_provider,
 )
 
+register_gateways()  # 网关类依赖 Provider 基类，必须在 providers 完整加载后注册
+
 PROJECT_JSON = "project.json"
+
+# 单价快照日期。模型与价格迭代很快，改动时务必同步更新这里和 references/providers.md
+RATES_AS_OF = "2026-11-15"
 
 # 粗略单价（元/秒，1080p 档），仅用于量级预估
 RATES = {
@@ -85,6 +102,10 @@ RATES = {
     ("veo", "veo-3.1-fast-generate-preview"): 1.20,
     ("luma", "ray-2"): 0.60,
     ("luma", "ray-flash-2"): 0.30,
+    # 网关：按各家中位价粗估，实际以网关账单为准
+    ("fal", "alibaba/wan-3.0/text-to-video"): 0.35,
+    ("fal", "fal-ai/wan/v2.7/reference-to-video"): 0.45,
+    ("heygen", "veo_3_1"): 1.80,
 }
 
 
@@ -93,6 +114,40 @@ def est_cost(provider: str, model: str, seconds: int) -> float:
     if rate is None:
         rate = next((v for (p, _), v in RATES.items() if p == provider), 0.3)
     return rate * seconds
+
+
+def max_cost_limit(args: argparse.Namespace, cfg: Config, root: Path) -> float | None:
+    """预算上限来源：--max-cost > project.json.max_cost > VS_MAX_COST 环境变量。"""
+    val = getattr(args, "max_cost", None)
+    if val is None:
+        try:
+            val = json.loads((root / PROJECT_JSON).read_text(encoding="utf-8")).get("max_cost")
+        except (OSError, json.JSONDecodeError, AttributeError):
+            val = None
+    if val in (None, ""):
+        val = cfg.get("VS_MAX_COST")
+    if val in (None, ""):
+        return None
+    try:
+        limit = float(val)
+    except (TypeError, ValueError):
+        fail(f"预算上限不是数字：{val}")
+    if limit <= 0:
+        fail("预算上限必须大于 0")
+    return limit
+
+
+def budget_guard(limit: float | None, provider: str, model: str, seconds: int,
+                 *, scale: float = 1.0, label: str = "") -> None:
+    """提交前的硬刹车。估算值只作量级参考，真实账单以各家控制台为准。"""
+    if limit is None:
+        return
+    est = est_cost(provider, model, seconds) * scale
+    if est > limit:
+        fail(f"预算守护拦截：{label or '本次生成'}预估约 ¥{est:.1f}，超过上限 ¥{limit:.1f}。\n"
+             "  可以调小 --takes / --draft、缩短时长、换更便宜的 provider，或提高 --max-cost。\n"
+             "  注意：这是按公开单价的粗估，不是账单。")
+    log(f"预算守护：预估 ¥{est:.1f} / 上限 ¥{limit:.1f}（粗估）", level="ok")
 
 
 def cost_scale(args: argparse.Namespace) -> float:
@@ -226,6 +281,8 @@ def cmd_doctor(args: argparse.Namespace) -> None:
 
 def cmd_models(args: argparse.Namespace) -> None:
     cfg = Config()
+    print(f"模型与费率快照：{RATES_AS_OF} · 厂商随时会改，用前请核对控制台")
+    print("网关型（fal / heygen）支持用 --model 传任意市场 model-id，不必等脚本更新。\n")
     for name in AUTO_ORDER:
         p = get_provider(name, cfg)
         flag = "✓" if p.available() else "·"
@@ -319,6 +376,8 @@ def cmd_gen(args: argparse.Namespace) -> None:
         fail("缺少 --prompt，例如：vs.py gen -p \"海边日落，镜头缓慢推进\" -d 5")
 
     provider = resolve_provider(args.provider or "auto", cfg, req)
+    budget_guard(max_cost_limit(args, cfg, root), provider.name,
+                 provider.pick_model(req), req.duration, label="单片段生成")
     store = JobStore(root)
     job = submit_and_track(cfg, store, provider, req, shot=args.shot or "",
                            auto_wait=not args.no_wait,
@@ -369,6 +428,79 @@ def shot_image(root: Path, value: str | None) -> str | None:
     return str((root / value).resolve()) if not is_url(value) else value
 
 
+def _fallback_candidates(cfg: Config, req: GenRequest, exclude: set[str]) -> list:
+    """失败后可选的备用模型：有密钥、能力匹配、优先便宜的，最多两家。"""
+    need = "last_frame" if (req.image and req.last_image) else ("i2v" if req.image else "t2v")
+    if req.ref_images:
+        need = "ref"
+    out = []
+    for name in AUTO_ORDER:
+        if name in exclude:
+            continue
+        p = get_provider(name, cfg)
+        if p.available() and need in p.supports:
+            out.append(p)
+        if len(out) == 2:
+            break
+    return out
+
+
+def _run_parallel(root: Path, sb: sbmod.Storyboard, todo: list, cfg: Config,
+                  store: JobStore, provider, bible: Bible, takes: TakesStore,
+                  args: argparse.Namespace, *, stage: str, n_takes: int,
+                  is_draft: bool, is_candidate: bool, write_back: bool,
+                  refs: list[str]) -> tuple[int, int]:
+    """先一次提交全部镜头，再统一轮询。比逐镜串行等待快得多。"""
+    items = []
+    meta: dict[str, tuple[Any, str]] = {}
+    for s in todo:
+        prompt = bible.compose_prompt(s.prompt, sb)
+        for k in range(n_takes):
+            label = takes.next_label(s.id) if is_candidate else ""
+            shot_name = (f"{s.id}-{label}" if is_candidate else
+                         f"draft-{s.id}" if is_draft else s.id)
+            req = GenRequest(
+                prompt=prompt, image=shot_image(root, s.image),
+                last_image=shot_image(root, s.last_image),
+                duration=s.duration, ratio=sb.ratio,
+                resolution="720p" if is_draft else sb.resolution,
+                audio=(sb.audio or getattr(args, "audio", False)) and not args.no_audio,
+                negative=bible.neg(sb),
+                seed=(bible.seed + k) if bible.seed is not None else None,
+                model=bible.model or None,
+            )
+            if refs:
+                req.ref_images = refs
+            items.append((shot_name, req))
+            meta[shot_name] = (s, label)
+
+    log(f"并发提交 {len(items)} 个任务（--parallel），随后统一轮询", level="step")
+    jobs = submit_many(cfg, store, provider, items, quiet=args.quiet)
+    if not args.no_wait:
+        jobs = wait_many(cfg, store, jobs, timeout=args.timeout, quiet=args.quiet)
+
+    ok = bad = 0
+    for job in jobs:
+        s, label = meta.get(job.shot, (None, ""))
+        job.extra.update({"stage": stage, "take": label, "refs": refs,
+                          "parallel": True, "identity": bible.identity})
+        store.save()
+        if job.state == "succeeded" and job.file:
+            ok += 1
+            if is_candidate and s:
+                takes.record(s.id, label, {"file": job.file, "stage": stage,
+                                           "provider": provider.name, "model": job.model,
+                                           "prompt": job.prompt, "job": job.id})
+            elif write_back and s:
+                s.video = job.file
+        else:
+            bad += 1
+            log(f"{job.shot} 未完成：{job.error}", level="warn")
+    if write_back:
+        sbmod.save(sb)
+    return ok, bad
+
+
 def cmd_run(args: argparse.Namespace) -> None:
     cfg = Config()
     root = project_root(required=True)
@@ -393,7 +525,13 @@ def cmd_run(args: argparse.Namespace) -> None:
     if is_draft and is_candidate:
         fail("--stage draft 和 --takes 不能同时用：先看草稿节奏，定稿阶段再做候选")
 
+    parallel = int(getattr(args, "parallel", 0) or 0)
+    if parallel and (is_draft or is_candidate):
+        fail("--parallel 暂不支持草稿/多候选模式（版本命名与写回会互相干扰）")
+
     chain_mode = bool(getattr(args, "chain", False))
+    if parallel and chain_mode:
+        fail("--parallel 与 --chain 不能同时用：尾帧链必须在生成下一镜之前完成，只能串行")
     if chain_mode and (is_draft or is_candidate):
         fail("--chain 只用于定稿生成，不能和 --stage draft / --takes 同时用")
     if chain_mode and not post.has_ffmpeg():
@@ -444,6 +582,20 @@ def cmd_run(args: argparse.Namespace) -> None:
     if is_candidate:
         log("候选模式：版本记入 .vs/takes.json，用 vs.py takes / pick 选版", level="step")
 
+    limit = max_cost_limit(args, cfg, root)
+    budget_guard(limit, provider.name, provider.pick_model(probe), total_sec,
+                 scale=0.5 if is_draft else 1.0, label=f"{len(todo)} 镜 {stage} 阶段")
+
+    if parallel:
+        ok, bad = _run_parallel(root, sb, todo, cfg, store, provider, bible, takes, args,
+                                stage=stage, n_takes=n_takes, is_draft=is_draft,
+                                is_candidate=is_candidate, write_back=write_back, refs=refs)
+        log(f"\n完成 {ok} 个，失败/待续 {bad} 个", level="ok" if bad == 0 else "warn")
+        if bad:
+            log("未完成的可稍后 `vs.py resume` 继续，不会重复扣费")
+        print(sbmod.report(sbmod.load(sb_path)))
+        return
+
     ok, bad = 0, 0
     for idx, s in enumerate(todo):
         log(f"\n── {s.id} · {s.desc or s.prompt[:30]}", level="step")
@@ -475,6 +627,27 @@ def cmd_run(args: argparse.Namespace) -> None:
                 log(f"{shot_name} 出错：{e}", level="err")
                 bad += 1
                 continue
+
+            # 显式开启的失败降级：换一家有密钥且能力匹配的模型救急。
+            # 失败任务通常不扣费，但重新提交会产生新任务，且风格可能漂移 → 必须用户同意。
+            if (getattr(args, "fallback", False) and job.state == "failed"
+                    and not args.no_wait and not is_draft):
+                for alt in _fallback_candidates(cfg, req, {provider.name}):
+                    log(f"{shot_name} 失败，改用 {alt.label} 重试（会产生新任务、风格可能漂移）",
+                        level="warn")
+                    try:
+                        alt_job = submit_and_track(cfg, store, alt, req, shot=shot_name,
+                                                   auto_wait=True, timeout=args.timeout,
+                                                   quiet=args.quiet)
+                    except (Exception, SystemExit) as e:
+                        log(f"备用模型也没成功：{e}", level="warn")
+                        continue
+                    if alt_job.state == "succeeded" and alt_job.file:
+                        job = alt_job
+                        job.extra["fallback_from"] = provider.name
+                        store.save()
+                        log(f"已由 {alt.label} 救回", level="ok")
+                        break
 
             # 可复现记录：prompt / 参考图 / seed / 模型 / 版本都留痕
             job.extra.update({"stage": stage, "take": label, "seed": req.seed,
@@ -631,8 +804,9 @@ def resolve_post_plan(args: argparse.Namespace, sb: sbmod.Storyboard) -> dict:
     subtitles = bool(getattr(args, "subtitles", False)) or (use_sb and has_text)
     if getattr(args, "no_subtitles", False):  # 兼容旧写法
         subtitles = False
-    if subtitles and not has_text:
-        log("分镜里没有字幕文案，字幕项自动跳过", level="warn")
+    # 外部对齐字幕（ASR / align 产出）自带文案，不依赖分镜里的 subtitle 字段
+    if subtitles and not has_text and not getattr(args, "srt", None):
+        log("分镜里没有字幕文案，字幕项自动跳过（要给外部字幕就加 --srt）", level="warn")
         subtitles = False
 
     bgm = getattr(args, "bgm", None) or (sb.bgm if use_sb else "") or ""
@@ -728,6 +902,30 @@ def cmd_plan(args: argparse.Namespace) -> None:
     print(plan_text(sb, plan, do_assemble=do_assemble,
                     clip_count=len(collect_clips(root, sb)),
                     scale=cost_scale(args), note=cost_note(args)))
+    limit = max_cost_limit(args, Config(), root)
+    if limit is not None:
+        print(f"  预算上限    ¥{limit:.1f}（提交前硬拦截，粗估）")
+
+    # 快速通道：只复用「上次确认过什么」的描述，绝不复用授权本身。
+    # 同一项目反复迭代时省去重新口述，但五轮询问与逐项确认一步都不能少。
+    auth = state_dir(root) / "authorization.json"
+    if getattr(args, "save_auth", False):
+        auth.parent.mkdir(parents=True, exist_ok=True)
+        auth.write_text(json.dumps({
+            "saved": now_stamp(), "assemble": do_assemble,
+            "confirmed": {k: plan[k] for k in
+                          ("subtitles", "audio", "bgm", "transition", "title", "fade")},
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        log("已保存授权快照，供下次对照（本次仍需逐项重新确认）", level="ok")
+    if getattr(args, "reuse", False):
+        if auth.is_file():
+            print("\n── 上次确认过的授权 · 仅作对照 ──")
+            print("  下面只是历史记录，**本次仍须逐项重新确认**，不能当作已授权。")
+            print("  " + json.dumps(json.loads(auth.read_text(encoding="utf-8")),
+                                   ensure_ascii=False).replace(",", ", "))
+        else:
+            print("\n  · 还没有授权快照：先跑一次 plan --save-auth")
+
     for p in sbmod.validate(sb):
         print(f"  ⚠ {p}")
 
@@ -810,9 +1008,21 @@ def cmd_assemble(args: argparse.Namespace) -> None:
 
     # 字幕（默认关闭，必须 --subtitles 或 --use-storyboard 显式开启）
     if plan["subtitles"]:
-        # 转场会吃掉重叠时长，字幕轴要同步压缩，否则越往后越提前
-        overlap = plan["transition_dur"] if (using_xfade and len(norm) > 2) else 0.0
-        cues = sbmod.timeline(sb, overlap=overlap)
+        if getattr(args, "srt", None):
+            # 外部 ASR / align 产出的真实时间轴，替代按字数估时
+            src_srt = Path(args.srt)
+            if not src_srt.is_absolute():
+                src_srt = root / src_srt
+            if not src_srt.is_file():
+                fail(f"找不到字幕文件：{src_srt}")
+            cues = _parse_cues(src_srt)
+            if not cues:
+                fail(f"字幕文件里没有解析出条目：{src_srt}")
+            log(f"使用外部对齐字幕：{src_srt}（{len(cues)} 条）", level="step")
+        else:
+            # 转场会吃掉重叠时长，字幕轴要同步压缩，否则越往后越提前
+            overlap = plan["transition_dur"] if (using_xfade and len(norm) > 2) else 0.0
+            cues = sbmod.timeline(sb, overlap=overlap)
         if lead:
             cues = [(a + lead, b + lead, t) for a, b, t in cues]
         if cues:
@@ -1042,6 +1252,40 @@ def cmd_qc(args: argparse.Namespace) -> None:
     print("\n════ 人工过目（机器替不了的部分）════")
     for i, item in enumerate(manual, 1):
         print(f"  □ {i}. {item}")
+    # 画面级证据：抽帧拼图 + 每处接缝的首/末帧，供人眼逐镜比对。
+    # 纯元数据检查发现不了换脸、服装变化、光线跳变，这一步必须留证据。
+    clips = [root / s.video for s in sb.shots
+             if s.video and (root / s.video).is_file()
+             and (root / s.video).stat().st_size > 1024]
+    work = state_dir(root) / "work"
+    if clips and post.has_ffmpeg():
+        work.mkdir(parents=True, exist_ok=True)
+        sheet = work / "qc-sheet.png"
+        if delivery is not None:
+            try:
+                delivery.contact_sheet(clips, sheet, cols=min(3, len(clips)))
+                print(f"\n════ 画面证据 ════\n  · 逐镜缩略图：{sheet}")
+            except (Exception, SystemExit) as e:
+                print(f"\n  · 缩略图生成失败（不影响其它检查）：{e}")
+        joint = work / "qc-joints"
+        joint.mkdir(parents=True, exist_ok=True)
+        made = 0
+        for i, s in enumerate(sb.shots):
+            p = root / s.video if s.video else None
+            if not p or not p.is_file():
+                continue
+            try:
+                post.extract_frame(p, joint / f"{s.id}-first.png", where="first")
+                post.extract_frame(p, joint / f"{s.id}-last.png", where="last")
+                made += 2
+            except (Exception, SystemExit):
+                pass
+        if made:
+            print(f"  · 每镜首/末帧：{joint}（重点比对上一镜末帧与下一镜首帧）")
+        print("  · 人工清单新增一项：打开缩略图，逐镜检查人物长相、服装、光线是否连贯")
+    elif clips:
+        print("\n  · 未装 ffmpeg，跳过画面证据（brew install ffmpeg 后可生成逐镜缩略图）")
+
     print("\n发现问题就在漂移传递下去之前用 vs.py run --only sX --force 重跑那一镜。")
     print("每镜的 prompt / seed / 模型 / 参考图都已记在 .vs/jobs.json，可复现。")
 
@@ -1064,7 +1308,230 @@ def cmd_estimate(args: argparse.Namespace) -> None:
         p = get_provider(name, Config())
         for m in p.models[:2]:
             print(f"{pad(name, 12)} {pad(m, 34)} ¥{est_cost(name, m, seconds) * scale:.1f}")
-    print("\n注：按 1080p 档粗估，实际以各家控制台账单为准。")
+    limit = max_cost_limit(args, Config(), Path.cwd())
+    if limit is not None:
+        print(f"\n预算上限：¥{limit:.1f}（来自 --max-cost / project.json / VS_MAX_COST）")
+    print(f"\n注：单价快照 {RATES_AS_OF}，按 1080p 档粗估，实际以各家控制台账单为准。")
+
+
+# ---------------------------------------------------------------- 音频 / 素材 / 改片 / 交付
+#
+# 这一整节都是「显式调用才执行」的能力：默认全关，必须用户明确要求才运行。
+# 新增能力不得绕过 SKILL.md 的多轮授权约束。
+
+
+def _need_delivery() -> None:
+    if delivery is None:
+        fail("交付层模块 vslib/delivery.py 不可用，请确认技能文件完整。")
+
+
+def cmd_voice(args: argparse.Namespace) -> None:
+    """中文配音（MiniMax TTS），并量出真实时长供字幕对齐。"""
+    root = project_root(required=True)
+    cfg = Config()
+    text = args.text
+    if not text and args.shot:
+        sb = sbmod.load(root / (args.storyboard or "storyboard.json"))
+        hit = next((s for s in sb.shots if s.id == args.shot), None)
+        if not hit:
+            fail(f"分镜里没有 {args.shot}")
+        text = hit.voiceover or hit.subtitle
+    if not text:
+        fail("给 --text 文案，或用 --shot s1 取该镜的旁白/字幕文案")
+    out = Path(args.out) if args.out else root / "audio" / f"vo-{now_stamp()}.mp3"
+    if not out.is_absolute():
+        out = root / out
+    post.tts(cfg, text, out, voice=args.voice, speed=args.speed)
+    dur = post.duration_of(out) if post.has_ffmpeg() else 0.0
+    print(json.dumps({"file": str(out), "duration": round(dur, 2),
+                      "text": text, "hint": "把该镜 duration 设为配音时长即可精确对齐"},
+                     ensure_ascii=False))
+    if args.replace_into:
+        src = Path(args.replace_into)
+        if not src.is_absolute():
+            src = root / src
+        if not src.is_file():
+            fail(f"找不到要替换音轨的视频：{src}")
+        dest = root / "output" / f"{src.stem}-vo.mp4"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        post.replace_audio(src, out, dest)
+        log(f"已替换音轨：{dest}", level="ok")
+
+
+def _parse_cues(path: Path) -> list[tuple[float, float, str]]:
+    """极简 SRT / VTT 解析，任何 ASR 工具导出的字幕都能直接喂进来。"""
+    import re
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    blocks = re.split(r"\n\s*\n", raw.replace("\r", ""))
+    cues: list[tuple[float, float, str]] = []
+    for b in blocks:
+        m = re.search(r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})\s*-->\s*"
+                      r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})", b)
+        if not m:
+            continue
+        g = [int(x) for x in m.groups()]
+        a = g[0] * 3600 + g[1] * 60 + g[2] + g[3] / 1000
+        z = g[4] * 3600 + g[5] * 60 + g[6] + g[7] / 1000
+        lines = [ln.strip() for ln in b.splitlines()
+                 if ln.strip() and not re.match(r"^\d+$", ln.strip()) and "-->" not in ln]
+        text = " ".join(lines)
+        if text:
+            cues.append((a, z, text))
+    return cues
+
+
+def cmd_align(args: argparse.Namespace) -> None:
+    """导入外部 ASR / 转录的 SRT、VTT，生成对齐后的时间轴。
+
+    本地不内置语音识别（那需要第三方 ASR 服务），但任何工具产出的 SRT
+    都能在这里对齐到真实时间轴，替代原来「按字数估时」的粗算。
+    """
+    root = project_root(required=True)
+    src = Path(args.srt)
+    if not src.is_absolute():
+        src = root / src
+    if not src.is_file():
+        fail(f"找不到字幕文件：{src}")
+    cues = _parse_cues(src)
+    if not cues:
+        fail("没有解析出字幕条目，确认是标准 SRT / WebVTT 时间轴格式")
+    sb = sbmod.load(root / (args.storyboard or "storyboard.json"))
+    span = sb.total_duration
+    tail = cues[-1][1]
+    out = Path(args.out) if args.out else state_dir(root) / "work" / "aligned.srt"
+    if not out.is_absolute():
+        out = root / out
+    post.write_srt(cues, out)
+    print(json.dumps({"source": str(src), "cues": len(cues),
+                      "last_cue": round(tail, 2), "storyboard_duration": span,
+                      "aligned_srt": str(out)}, ensure_ascii=False))
+    if tail > span + 0.5:
+        log(f"字幕比画面长 {tail - span:.1f}s：要么拉长镜头 duration，要么精简文案", level="warn")
+    else:
+        log("字幕时间轴落在画面时长内 ✓", level="ok")
+    if args.use_for_subtitles:
+        log("这是显式对齐结果，可直接传给 assemble 烧字幕："
+            f"vs.py assemble --subtitles --srt {out}", level="step")
+
+
+def cmd_media(args: argparse.Namespace) -> None:
+    """生成静帧 / 音乐 / 音效素材（走 fal 网关，需要 FAL_KEY）。"""
+    root = project_root(required=True)
+    out = Path(args.out) if args.out else root / "assets" / f"{args.kind}-{now_stamp()}"
+    if not out.is_absolute():
+        out = root / out
+    if not out.suffix:
+        out = out.with_suffix({"image": ".png", "music": ".mp3",
+                               "sfx": ".wav", "video": ".mp4"}[args.kind])
+    r = gateway.generate_media(Config(), kind=args.kind, prompt=args.prompt,
+                               model=args.model, out=out, timeout=args.timeout)
+    print(json.dumps({"file": r["file"], "model": r["model"],
+                      "verified": "structure-only", "as_of": gateway.STRUCTURE_VERIFIED_AS_OF},
+                     ensure_ascii=False))
+
+
+def cmd_edit(args: argparse.Namespace) -> None:
+    """Gemini Omni 对话式局部改片 / 续写。"""
+    root = project_root(required=True)
+    edits_path = state_dir(root) / "edits.json"
+    history = {}
+    if edits_path.is_file():
+        try:
+            history = json.loads(edits_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pass
+    prev = args.previous
+    if prev == "last":
+        prev = history.get("last_id") or ""
+    video = Path(args.video) if args.video else None
+    if video and not video.is_absolute():
+        video = root / video
+    out = Path(args.out) if args.out else root / "output" / f"edit-{now_stamp()}.mp4"
+    if not out.is_absolute():
+        out = root / out
+    r = gateway.omni_edit(Config(), prompt=args.prompt, video=video,
+                          video_uri=args.video_uri, previous_id=prev or None,
+                          out=out, aspect_ratio=args.ratio, duration=args.duration)
+    history["last_id"] = r["id"]
+    history.setdefault("turns", []).append({"id": r["id"], "prompt": args.prompt,
+                                            "file": r["file"]})
+    edits_path.parent.mkdir(parents=True, exist_ok=True)
+    edits_path.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps({"file": r["file"], "interaction": r["id"],
+                      "next": "继续改可加 --previous last",
+                      "verified": "structure-only"}, ensure_ascii=False))
+
+
+def _latest_video(root: Path) -> Path:
+    files = sorted((root / "output").glob("*.mp4"), key=lambda p: p.stat().st_mtime,
+                   reverse=True)
+    if not files:
+        fail("output/ 里没有成片。先跑 vs.py assemble，或用 --src 指定文件。")
+    return files[0]
+
+
+def cmd_export(args: argparse.Namespace) -> None:
+    """一次导出多个平台规格（显式调用）。"""
+    _need_delivery()
+    root = project_root(required=True)
+    src = Path(args.src) if args.src else _latest_video(root)
+    if not src.is_absolute():
+        src = root / src
+    if not src.is_file():
+        fail(f"找不到成片：{src}")
+    out_dir = Path(args.out_dir) if args.out_dir else root / "output" / "platforms"
+    if not out_dir.is_absolute():
+        out_dir = root / out_dir
+    names = [x.strip() for x in args.presets.split(",") if x.strip()]
+    bad = [n for n in names if n not in delivery.PLATFORM_PRESETS]
+    if bad:
+        fail(f"未知平台预设：{', '.join(bad)}。用 vs.py presets 看全部。")
+    files = delivery.export_all(src, out_dir, names, watermark=args.watermark or "")
+    if args.cover:
+        cover = out_dir / "cover.png"
+        delivery.cover_frame(src, cover, at=args.cover_at)
+        files.append(cover)
+    for f in files:
+        print(str(f))
+
+
+def cmd_sheet(args: argparse.Namespace) -> None:
+    """候选版本并排预览图，挑 A/B/C 时不用一个个点开视频。"""
+    _need_delivery()
+    root = project_root(required=True)
+    if args.clips:
+        clips = [Path(x) if Path(x).is_absolute() else root / x
+                 for x in args.clips.split(",") if x.strip()]
+    else:
+        sb = sbmod.load(root / (args.storyboard or "storyboard.json"))
+        clips = [root / s.video for s in sb.shots
+                 if s.video and (root / s.video).is_file()]
+    clips = [c for c in clips if c.is_file()]
+    if not clips:
+        fail("没有可预览的片段。用 --clips a.mp4,b.mp4 指定。")
+    out = Path(args.out) if args.out else state_dir(root) / "work" / "candidates.png"
+    if not out.is_absolute():
+        out = root / out
+    delivery.contact_sheet(clips, out, cols=args.cols)
+    print(str(out))
+
+
+def cmd_cover(args: argparse.Namespace) -> None:
+    _need_delivery()
+    root = project_root(required=True)
+    src = Path(args.src) if args.src else _latest_video(root)
+    if not src.is_absolute():
+        src = root / src
+    out = Path(args.out) if args.out else root / "output" / "cover.png"
+    if not out.is_absolute():
+        out = root / out
+    delivery.cover_frame(src, out, at=args.at)
+    print(str(out))
+
+
+def cmd_presets(args: argparse.Namespace) -> None:
+    _need_delivery()
+    print(delivery.list_presets())
 
 
 # ---------------------------------------------------------------- 入口
@@ -1078,6 +1545,11 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=__doc__,
     )
     ap.add_argument("-q", "--quiet", action="store_true", help="只输出关键信息")
+    try:
+        _ver = (Path(__file__).resolve().parents[1] / "VERSION").read_text(encoding="utf-8").strip()
+    except OSError:
+        _ver = "0.2.0"
+    ap.add_argument("--version", action="version", version=f"video-studio {_ver}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("doctor", help="自检环境与密钥")
@@ -1117,6 +1589,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--shot", help="镜头名，用于文件命名")
     p.add_argument("--no-wait", action="store_true", help="提交后立即返回，不等待")
     p.add_argument("--timeout", type=int, default=900)
+    p.add_argument("--max-cost", type=float,
+                   help="本次生成的人民币粗估上限，超过就拦截（也可设 VS_MAX_COST）")
     p.set_defaults(func=cmd_gen)
 
     p = sub.add_parser("run", help="按分镜批量生成")
@@ -1140,6 +1614,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="逐镜尾帧链：生成完一镜就抽末帧接成下一镜首帧（需 ffmpeg，且须先得到用户确认）")
     p.add_argument("--unlock-model", action="store_true",
                    help="解除本项目的模型锁定，允许换 provider（换模型会导致风格漂移）")
+    p.add_argument("--parallel", type=int, default=0, metavar="N",
+                   help="先批量提交全部镜头再统一轮询（填任意非零数开启），显著缩短多镜总耗时")
+    p.add_argument("--fallback", action="store_true",
+                   help="某镜失败时自动换备用模型重试；会产生新任务且风格可能漂移，须用户同意")
+    p.add_argument("--max-cost", type=float,
+                   help="整批生成的人民币粗估上限，超过就拦截（也可写进 project.json）")
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("list", help="查看任务列表")
@@ -1161,6 +1641,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("assemble", help="合成成片（默认纯拼接，附加效果需显式开启）")
     add_post_options(p, with_audio=False)
     p.add_argument("-o", "--out")
+    p.add_argument("--srt", help="外部对齐字幕（align 产出或 ASR 的 SRT），配合 --subtitles 使用")
     p.add_argument("--rebuild", action="store_true", help="不复用中间文件")
     p.set_defaults(func=cmd_assemble)
 
@@ -1168,6 +1649,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_post_options(p)
     p.add_argument("--assemble", action="store_true",
                    help="本次计划包含剪辑合并；不带则计划只交付片段")
+    p.add_argument("--max-cost", type=float, help="在确认单上显示预算上限")
+    p.add_argument("--save-auth", action="store_true",
+                   help="用户逐项确认后，保存授权快照供下次对照（不跳过询问）")
+    p.add_argument("--reuse", action="store_true",
+                   help="显示上次确认过的授权摘要；仅作对照，本次仍须逐项重新确认")
     p.set_defaults(func=cmd_plan)
 
     p = sub.add_parser("clips", help="列出可直接交付的片段（不剪辑时用）")
@@ -1177,6 +1663,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("estimate", help="预估成本（按实际生成量报账）")
     p.add_argument("-s", "--storyboard")
+    p.add_argument("--max-cost", type=float, help="显示预算上限")
     p.add_argument("--takes", type=int, default=1,
                    help="每镜生成几个候选版本，成本按倍数计")
     p.add_argument("--draft", action="store_true",
@@ -1210,9 +1697,71 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fps", type=int, default=30)
     p.set_defaults(func=cmd_animatic)
 
-    p = sub.add_parser("qc", help="成片前质检（自动检查 + 人工清单）")
+    p = sub.add_parser("qc", help="成片前质检（自动检查 + 画面证据 + 人工清单）")
     p.add_argument("-s", "--storyboard", default="storyboard.json")
     p.set_defaults(func=cmd_qc)
+
+    p = sub.add_parser("voice", help="生成中文配音并量出真实时长（MiniMax TTS）")
+    p.add_argument("--text", help="配音文案")
+    p.add_argument("--shot", help="改用分镜里该镜的旁白/字幕文案")
+    p.add_argument("-s", "--storyboard", default="storyboard.json")
+    p.add_argument("-o", "--out")
+    p.add_argument("--voice", default="male-qn-qingse")
+    p.add_argument("--speed", type=float, default=1.0)
+    p.add_argument("--replace-into", help="顺带把配音替换进这个视频文件（显式要求才做）")
+    p.set_defaults(func=cmd_voice)
+
+    p = sub.add_parser("align", help="导入 ASR/SRT 字幕并生成对齐后的时间轴")
+    p.add_argument("--srt", required=True, help="SRT / WebVTT 字幕文件")
+    p.add_argument("-s", "--storyboard", default="storyboard.json")
+    p.add_argument("-o", "--out")
+    p.add_argument("--use-for-subtitles", action="store_true",
+                   help="打印把对齐字幕烧进成片的命令")
+    p.set_defaults(func=cmd_align)
+
+    p = sub.add_parser("media", help="生成静帧/音乐/音效/视频素材（fal 网关，需 FAL_KEY）")
+    p.add_argument("--kind", required=True, choices=["image", "music", "sfx", "video"])
+    p.add_argument("--prompt", required=True)
+    p.add_argument("--model", help="fal 市场的 model-id，不填用该类型的默认值")
+    p.add_argument("-o", "--out")
+    p.add_argument("--timeout", type=int, default=600)
+    p.set_defaults(func=cmd_media)
+
+    p = sub.add_parser("edit", help="对话式局部改片 / 续写（Gemini Omni，需 GEMINI_API_KEY）")
+    p.add_argument("--prompt", required=True, help="怎么改，例如「把车换成红色，其它保持不变」")
+    p.add_argument("--video", help="本地视频（≤4MB，内联 base64）")
+    p.add_argument("--video-uri", help="已上传到 Files API 的视频 URI")
+    p.add_argument("--previous", help="上一轮 interaction id，或 last")
+    p.add_argument("-o", "--out")
+    p.add_argument("--ratio", default="16:9", choices=["16:9", "9:16"])
+    p.add_argument("--duration", type=int, help="3–15 秒")
+    p.set_defaults(func=cmd_edit)
+
+    p = sub.add_parser("export", help="导出多个平台规格（尺寸/码率/水印/封面）")
+    p.add_argument("--presets", default="douyin,bilibili",
+                   help="逗号分隔，见 vs.py presets")
+    p.add_argument("--src", help="源成片，默认取 output/ 最新 mp4")
+    p.add_argument("--out-dir")
+    p.add_argument("--watermark", help="右下角水印文字")
+    p.add_argument("--cover", action="store_true", help="顺带抽一张封面")
+    p.add_argument("--cover-at", type=float, default=1.0)
+    p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser("sheet", help="候选片段并排预览图")
+    p.add_argument("--clips", help="逗号分隔的视频路径，默认取分镜里的片段")
+    p.add_argument("-s", "--storyboard", default="storyboard.json")
+    p.add_argument("-o", "--out")
+    p.add_argument("--cols", type=int, default=3)
+    p.set_defaults(func=cmd_sheet)
+
+    p = sub.add_parser("cover", help="从成片抽一张封面")
+    p.add_argument("--src")
+    p.add_argument("-o", "--out")
+    p.add_argument("--at", type=float, default=1.0)
+    p.set_defaults(func=cmd_cover)
+
+    p = sub.add_parser("presets", help="列出平台导出预设")
+    p.set_defaults(func=cmd_presets)
 
     return ap
 
