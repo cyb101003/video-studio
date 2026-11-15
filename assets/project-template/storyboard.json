@@ -1,0 +1,44 @@
+{
+  "_hint": "这是示范模板。audio/bgm/transition/subtitle/voiceover 都是用户未确认时的默认状态：全部关闭。只有用户逐项明确说了「要」，才改成对应值。分镜内容请替换成用户确认过的方案。",
+  "title": "示例：咖啡店宣传片",
+  "ratio": "9:16",
+  "resolution": "1080p",
+  "audio": false,
+  "voiceover": false,
+  "style": "温暖治愈，浅景深，自然光，胶片颗粒，暖色调",
+  "negative": "文字, 水印, logo, 畸形手指, 面部扭曲, 模糊",
+  "transition": "none",
+  "transition_dur": 0.5,
+  "bgm": "",
+  "font_size": 20,
+  "shots": [
+    {
+      "id": "s1",
+      "desc": "开场：晨光洒进店内",
+      "prompt": "清晨的光线从落地窗斜射进咖啡馆，木桌上摆着一杯冒热气的拿铁，尘埃在光柱中漂浮，镜头缓慢向前推进，浅景深",
+      "duration": 5,
+      "image": "images/s1.png"
+    },
+    {
+      "id": "s2",
+      "desc": "手冲过程特写",
+      "prompt": "咖啡师的手持手冲壶，热水呈细线注入滤杯，咖啡粉膨胀冒出气泡，蒸汽升腾，微距特写，侧逆光",
+      "duration": 5,
+      "image": "images/s2.png"
+    },
+    {
+      "id": "s3",
+      "desc": "店内氛围",
+      "prompt": "靠窗的座位上，一个年轻人低头翻书，暖黄吊灯照亮桌面，窗外是雨天的街道，中景，镜头缓慢横移",
+      "duration": 5,
+      "image": "images/s3.png"
+    },
+    {
+      "id": "s4",
+      "desc": "产品特写收尾",
+      "prompt": "拿铁表面拉出心形拉花，杯壁凝着细密水珠，背景是虚化的木质吧台，俯拍微距，光线柔和",
+      "duration": 5,
+      "image": "images/s4.png"
+    }
+  ]
+}

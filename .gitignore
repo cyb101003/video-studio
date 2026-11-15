@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 密钥与本地配置（绝不能提交）
+.env
+.env.*
+*.key
+*.pem
+
+# 媒体产物（体积大，也可能含用户素材）
+*.mp4
+*.mov
+*.mkv
+*.mp3
+*.wav
+*.part
+
+# 系统与打包产物
+.DS_Store
+dist/
+*.zip
